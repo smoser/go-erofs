@@ -488,9 +488,11 @@ func (img *image) zmapLookup(fi *inode, ofs int64) (zextent, error) {
 // previous extent's partial tail), so we can't just round to a whole
 // lcluster.
 //
-// Mirrors z_erofs_get_extent_decompressedlen in fs/erofs/zmap.c.
+// Mirrors z_erofs_get_extent_decompressedlen in fs/erofs/zmap.c. The walk
+// starts at headLcn+1 — zmapLookup has already loaded and classified the
+// HEAD at headLcn, so re-reading it would be wasted I/O.
 func (img *image) extentDecompressedEnd(fi *inode, z *zmapState, headLcn uint32) (int64, error) {
-	lcn := headLcn
+	lcn := headLcn + 1
 	for {
 		if int64(lcn)<<z.lclusterBits >= fi.size {
 			return fi.size, nil
@@ -510,11 +512,7 @@ func (img *image) extentDecompressedEnd(fi *inode, z *zmapState, headLcn uint32)
 			}
 			lcn += uint32(d1)
 		default:
-			if lcn != headLcn {
-				return int64(lcn)<<z.lclusterBits + int64(m.clusterOfs), nil
-			}
-			// First HEAD — start the walk one ahead.
-			lcn++
+			return int64(lcn)<<z.lclusterBits + int64(m.clusterOfs), nil
 		}
 	}
 }
