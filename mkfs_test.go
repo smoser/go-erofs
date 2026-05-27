@@ -3911,3 +3911,52 @@ func TestCreateFSCompressionBigPcluster(t *testing.T) {
 	erofstest.CheckFileBytes(t, efs, "big.txt", bigCompressible)
 	erofstest.CheckFileBytes(t, efs, "rand.bin", incompressible)
 }
+
+// TestReadRejectsBigPclusterWithoutSBFeature verifies the reader rejects an
+// image that sets BIG_PCLUSTER_1 in a per-inode map header but doesn't set
+// the matching superblock feature bit. The kernel rejects this combination
+// as -EFSCORRUPTED; we mirror that so a buggy writer is caught locally
+// instead of producing kernel-unreadable images that pass our own roundtrip.
+func TestReadRejectsBigPclusterWithoutSBFeature(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithCompression(erofs.CompressionLZ4))
+	// Need enough data for the writer to emit a multi-lcluster pcluster.
+	data := bytes.Repeat([]byte("the quick brown fox\n"), 4096)
+	f, err := w.Create("/file.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	img := buf.Bytes()
+
+	// Sanity check: the image really uses BIG_PCLUSTER. If not, this test
+	// isn't exercising what it claims to.
+	const fiOff = disk.SuperBlockOffset + 80
+	sbFeatBefore := binary.LittleEndian.Uint32(img[fiOff : fiOff+4])
+	if sbFeatBefore&disk.FeatureIncompatBigPcluster == 0 {
+		t.Fatalf("writer didn't set BIG_PCLUSTER feature bit (feat=0x%x); test won't exercise the check", sbFeatBefore)
+	}
+
+	// Clear the BIG_PCLUSTER bit only, leaving LZ4_0PADDING etc. in place.
+	binary.LittleEndian.PutUint32(img[fiOff:fiOff+4], sbFeatBefore&^disk.FeatureIncompatBigPcluster)
+
+	efs, err := erofs.Open(bytes.NewReader(img))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	_, err = fs.ReadFile(efs, "file.bin")
+	if err == nil {
+		t.Fatal("expected ReadFile to fail when BIG_PCLUSTER_1 is set but sb feature is cleared")
+	}
+	if !errors.Is(err, erofs.ErrInvalid) {
+		t.Errorf("expected ErrInvalid, got %v", err)
+	}
+}

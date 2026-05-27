@@ -107,6 +107,24 @@ func (img *image) zmapInitLocked(fi *inode, z *zmapState) error {
 		}
 		return fmt.Errorf("unsupported h_advise bits 0x%x: %w", unsupported, ErrNotImplemented)
 	}
+	// Mirror the kernel's consistency check (fs/erofs/zmap.c): BIG_PCLUSTER_1
+	// in h_advise must agree with the superblock's BIG_PCLUSTER feature bit.
+	// An image that sets the per-inode bit without the sb feature is rejected
+	// by the kernel as -EFSCORRUPTED; reject it here too so writers that
+	// forget the sb bit fail loudly rather than silently producing
+	// kernel-unreadable images.
+	if h.HAdvise&disk.ZErofsAdviseBigPcluster1 != 0 &&
+		img.sb.FeatureIncompat&disk.FeatureIncompatBigPcluster == 0 {
+		return fmt.Errorf("BIG_PCLUSTER_1 advise without sb feature bit for nid %d: %w",
+			fi.nid, ErrInvalid)
+	}
+	// COMPRESSED_COMPACT + BIG_PCLUSTER_1 needs a separate pblk loop the
+	// compact decoder doesn't yet implement (see fs/erofs/zmap.c:212-233).
+	// Reject the combination up front rather than failing mid-read.
+	if fi.inodeLayout == disk.LayoutCompressedCompact &&
+		h.HAdvise&disk.ZErofsAdviseBigPcluster1 != 0 {
+		return fmt.Errorf("big pcluster in compact layout: %w", ErrNotImplemented)
+	}
 
 	// h_clusterbits high bit signals whole-file fragment storage; reject.
 	if h.ClusterBits>>7 != 0 {
