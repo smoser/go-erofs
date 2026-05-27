@@ -248,6 +248,15 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 			featureIncompat |= disk.FeatureIncompatLZ4_0Padding
 			algoID, _, _ := pickCompressor(w.compression)
 			comprAlgs |= 1 << algoID
+			// The kernel rejects images that use BIG_PCLUSTER_1 advise
+			// without the matching superblock feature bit ("per-inode
+			// big pcluster without sb feature" → -EFSCORRUPTED, see
+			// fs/erofs/zmap.c). Set FeatureIncompatBigPcluster as soon
+			// as any pcluster in the entry actually spans more than one
+			// block. The bit shares value 0x2 with COMPR_CFGS.
+			if entryHasBigPcluster(e) {
+				featureIncompat |= disk.FeatureIncompatBigPcluster
+			}
 		}
 	}
 
