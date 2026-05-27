@@ -3773,3 +3773,77 @@ func TestCreateFSCompressionLZ4(t *testing.T) {
 	erofstest.CheckFileBytes(t, efs, "tailed.bin", tailed)
 	erofstest.CheckFileBytes(t, efs, "big-compressible.bin", bigCompressible)
 }
+
+// TestReadAcceptsCompacted2BAdvise verifies the reader accepts images whose
+// z_erofs_map_header has the COMPACTED_2B advise bit set. Stock mkfs.erofs
+// emits this bit on any compact-layout image whose total lcluster count is
+// large enough to trigger the 2-byte-per-entry packed run; rejecting it
+// would block reading those images. The fix is checked synthetically by
+// flipping the bit on a writer-produced image (the writer doesn't emit
+// compact layout itself, but the advise bit is harmless for FULL layout
+// and the rejection happened in the shared map-header parser).
+func TestReadAcceptsCompacted2BAdvise(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithCompression(erofs.CompressionLZ4))
+	data := bytes.Repeat([]byte("compressible data here\n"), 200)
+	f, err := w.Create("/file.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	img := buf.Bytes()
+
+	// Find file.bin's nid via the reader, then locate the map header by
+	// re-parsing the inode core ourselves.
+	efs, err := erofs.Open(bytes.NewReader(img))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	fi, err := fs.Stat(efs, "file.bin")
+	if err != nil {
+		t.Fatal("Stat:", err)
+	}
+	st := fi.Sys().(*erofs.Stat)
+
+	var sb disk.SuperBlock
+	if _, err := binary.Decode(img[disk.SuperBlockOffset:disk.SuperBlockOffset+disk.SizeSuperBlock], binary.LittleEndian, &sb); err != nil {
+		t.Fatal("decode superblock:", err)
+	}
+	blockSize := int64(1) << sb.BlkSizeBits
+	iloc := int64(sb.MetaBlkAddr)*blockSize + st.Ino*disk.SizeInodeCompact
+
+	format := binary.LittleEndian.Uint16(img[iloc : iloc+2])
+	layout := uint8((format & 0x0E) >> 1)
+	if layout != disk.LayoutCompressedFull {
+		t.Fatalf("expected LayoutCompressedFull (%d), got %d", disk.LayoutCompressedFull, layout)
+	}
+	icsize := int64(disk.SizeInodeCompact)
+	if format&0x01 != 0 {
+		icsize = disk.SizeInodeExtended
+	}
+	xattrIcount := binary.LittleEndian.Uint16(img[iloc+2 : iloc+4])
+	var xsize int64
+	if xattrIcount > 0 {
+		xsize = int64(xattrIcount-1)*disk.SizeXattrEntry + disk.SizeXattrBodyHeader
+	}
+	hdrPos := (iloc + icsize + xsize + 7) &^ 7
+
+	// HAdvise lives at bytes 4-5 of the 8-byte map header.
+	const hAdviseOff = 4
+	img[hdrPos+hAdviseOff] |= byte(disk.ZErofsAdviseCompacted2B)
+
+	efs2, err := erofs.Open(bytes.NewReader(img))
+	if err != nil {
+		t.Fatal("Open after setting COMPACTED_2B:", err)
+	}
+	erofstest.CheckFileBytes(t, efs2, "file.bin", data)
+}

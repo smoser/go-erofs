@@ -84,9 +84,12 @@ func (img *image) zmapInitLocked(fi *inode, z *zmapState) error {
 	}
 
 	// Reject features this implementation does not support.
-	unsupported := h.HAdvise &^ uint16(0)
-	const acceptedAdvise = uint16(0) // none of the advanced bits are supported
-	if h.HAdvise &^ acceptedAdvise != 0 {
+	//
+	// Compacted2B is the layout hint for the compact lcluster index — it
+	// just says the index uses a 2-byte-per-entry run in addition to the
+	// 4-byte run, and the compact decoder consults it directly. Accept it.
+	const acceptedAdvise = uint16(disk.ZErofsAdviseCompacted2B)
+	if unsupported := h.HAdvise &^ acceptedAdvise; unsupported != 0 {
 		// Map specific bits to clearer messages.
 		switch {
 		case h.HAdvise&disk.ZErofsAdviseFragmentPcluster != 0:
