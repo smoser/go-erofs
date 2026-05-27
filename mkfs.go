@@ -659,6 +659,7 @@ func (fsys *Writer) Close() error {
 		chunkBits:   chunkBits,
 		zeroBuf:     make([]byte, fsys.blockSize),
 		compression: fsys.compression,
+		tempDir:     fsys.tempDir,
 	}
 
 	ew.planLayout(root)
@@ -1087,15 +1088,15 @@ type erofsEntry struct {
 	dataBlkAddr uint32
 
 	// Compressed regular file state. nLclusters is set during planLayout.
-	// compressEntry is called between planLayout and write: it fills
-	// compressedData (the on-disk pcluster bytes, exactly nPblks blocks),
-	// lclusterEntries (one entry per lcluster), and nPblks (the actual
-	// physical block count, which may be less than nLclusters when
-	// big-pcluster grouping wins).
+	// compressEntry is called between planLayout and write: it appends the
+	// on-disk pcluster bytes (exactly nPblks blocks) to the writer's shared
+	// cspool starting at cspoolOff, fills lclusterEntries (one entry per
+	// lcluster) and sets nPblks (the actual physical block count, which
+	// may be less than nLclusters when big-pcluster grouping wins).
 	nLclusters      uint32
 	nPblks          uint32
+	cspoolOff       int64
 	lclusterEntries []lclusterEntry
-	compressedData  []byte
 }
 
 // lclusterEntry captures the on-disk z_erofs_lcluster_index entry for one

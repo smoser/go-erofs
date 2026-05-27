@@ -38,6 +38,17 @@ type erofsWriter struct {
 	zeroBuf     []byte                       // blockSize-length zero buffer for padding
 	inodeBuf    [disk.SizeInodeExtended]byte // scratch buffer for writeInode
 	compression Compression                  // compression algorithm for regular file data
+
+	// cspool holds the compressed bytes for every LayoutCompressedFull entry,
+	// appended sequentially during compressEntries and copied back to the
+	// output during writeDataBlocks. Using a tempfile (rather than a per-
+	// entry []byte) caps peak memory at O(scratch buffers) regardless of
+	// image size. Created lazily on the first compressed entry; the underlying
+	// file is unlinked immediately after open so it'll be reclaimed when the
+	// fd closes.
+	cspool    *os.File
+	cspoolOff int64
+	tempDir   string // mirror of fsys.tempDir for the cspool
 }
 
 // inodeSize returns the on-disk inode header size for e.
@@ -74,6 +85,7 @@ func (w *erofsWriter) minChunkBits(size uint64) uint8 {
 
 func (w *erofsWriter) write(out io.WriteSeeker) error {
 	w.copyBuf = make([]byte, 256*1024) // shared io.CopyBuffer buffer
+	defer w.closeCspool()
 	return w.writeSeekable(out)
 }
 
@@ -825,10 +837,12 @@ func (w *erofsWriter) flatPlainDataSize(e *erofsEntry) int {
 const maxPclusterLclusters = 4
 
 // compressEntries walks all entries and pre-compresses any LayoutCompressedFull
-// regular files into per-entry buffers. After this returns, each compressed
-// entry has its compressedData (nPblks blocks of bytes), lclusterEntries (one
-// per lcluster), and nPblks (actual physical block count) populated, so
-// assignDataBlocks and entryDataBlocks can use the real on-disk size.
+// regular files into the shared cspool tempfile. After this returns, each
+// compressed entry has its cspoolOff (start offset in the spool), nPblks
+// (physical block count, also = len(spool slice) / blockSize), and
+// lclusterEntries populated, so assignDataBlocks and entryDataBlocks can use
+// the real on-disk size. The cspool itself is unlinked on creation and
+// freed automatically when the writer closes it via closeCspool().
 func (w *erofsWriter) compressEntries() error {
 	for _, e := range w.entries {
 		if e.layout != disk.LayoutCompressedFull {
@@ -837,6 +851,40 @@ func (w *erofsWriter) compressEntries() error {
 		if err := w.compressEntry(e); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// ensureCspool lazily opens the shared compressed-data spool. The tempfile
+// is unlinked immediately so it disappears when the fd closes, matching the
+// raw-data spool in Writer.ensureSpool.
+func (w *erofsWriter) ensureCspool() error {
+	if w.cspool != nil {
+		return nil
+	}
+	tmp, err := os.CreateTemp(w.tempDir, "erofs-cdata-*")
+	if err != nil {
+		return fmt.Errorf("create compressed-data spool: %w", err)
+	}
+	_ = os.Remove(tmp.Name())
+	w.cspool = tmp
+	return nil
+}
+
+// closeCspool releases the spool fd. Safe to call multiple times.
+func (w *erofsWriter) closeCspool() {
+	if w.cspool != nil {
+		_ = w.cspool.Close()
+		w.cspool = nil
+	}
+}
+
+// cspoolWrite appends p to the cspool and advances cspoolOff.
+func (w *erofsWriter) cspoolWrite(p []byte) error {
+	n, err := w.cspool.Write(p)
+	w.cspoolOff += int64(n)
+	if err != nil {
+		return fmt.Errorf("write compressed-data spool: %w", err)
 	}
 	return nil
 }
@@ -866,17 +914,22 @@ func (w *erofsWriter) compressEntry(e *erofsEntry) error {
 		}
 	}()
 
+	if err := w.ensureCspool(); err != nil {
+		return err
+	}
+	e.cspoolOff = w.cspoolOff
+
 	bs := w.blockSize
 	nlcn := int(e.nLclusters)
 	e.lclusterEntries = make([]lclusterEntry, nlcn)
 
-	// Scratch buffers sized for the biggest batch.
+	// Scratch buffers sized for the biggest batch. These live on the stack
+	// frame and are released when compressEntry returns.
 	rawBatch := make([]byte, maxPclusterLclusters*bs)
 	compressedBatch := make([]byte, maxPclusterLclusters*bs)
 	// Per-block scratch used by the single-lcluster fallback.
 	compressed := make([]byte, bs)
 
-	var out []byte // accumulates exactly nPblks * blockSize bytes
 	remaining := int64(e.size)
 	pblk := uint32(0) // physical block index within the entry
 	i := 0
@@ -931,10 +984,14 @@ func (w *erofsWriter) compressEntry(e *erofsEntry) error {
 							delta1: uint16(k - j),
 						}
 					}
-					// Write m blocks of compressed data + zero pad.
-					out = append(out, compressedBatch[:n]...)
+					// Append m blocks of compressed data + zero pad to the spool.
+					if err := w.cspoolWrite(compressedBatch[:n]); err != nil {
+						return err
+					}
 					if pad := m*bs - n; pad > 0 {
-						out = append(out, make([]byte, pad)...)
+						if err := w.cspoolWrite(w.zeroBuf[:pad]); err != nil {
+							return err
+						}
 					}
 					pblk += uint32(m)
 					i += k
@@ -955,15 +1012,21 @@ func (w *erofsWriter) compressEntry(e *erofsEntry) error {
 					typ:  disk.ZErofsLclusterTypePlain,
 					pblk: pblk,
 				}
-				out = append(out, block...)
+				if err := w.cspoolWrite(block); err != nil {
+					return err
+				}
 			} else {
 				e.lclusterEntries[i+j] = lclusterEntry{
 					typ:  disk.ZErofsLclusterTypeHead1,
 					pblk: pblk,
 				}
-				out = append(out, compressed[:n]...)
+				if err := w.cspoolWrite(compressed[:n]); err != nil {
+					return err
+				}
 				if pad := bs - n; pad > 0 {
-					out = append(out, make([]byte, pad)...)
+					if err := w.cspoolWrite(w.zeroBuf[:pad]); err != nil {
+						return err
+					}
 				}
 			}
 			pblk++
@@ -971,21 +1034,20 @@ func (w *erofsWriter) compressEntry(e *erofsEntry) error {
 		i += k
 	}
 
-	e.compressedData = out
 	e.nPblks = pblk
-	if len(out) != int(pblk)*bs {
-		return fmt.Errorf("internal: %s emitted %d bytes for %d pblks (blockSize=%d)",
-			e.path, len(out), pblk, bs)
+	if w.cspoolOff-e.cspoolOff != int64(pblk)*int64(bs) {
+		return fmt.Errorf("internal: %s emitted %d spool bytes for %d pblks (blockSize=%d)",
+			e.path, w.cspoolOff-e.cspoolOff, pblk, bs)
 	}
 	return nil
 }
 
-// writeCompressedData writes the pre-computed compressed bytes for e. Block
-// addresses inside e.lclusterEntries are relative to the entry; here we
-// rewrite them with the absolute dataBlkAddr so writeCompressedTrailing can
-// emit them as-is.
+// writeCompressedData streams an entry's pre-compressed bytes from the spool
+// to the output. Block addresses inside e.lclusterEntries are relative to
+// the start of the entry's data area; here we rewrite them with the
+// absolute dataBlkAddr so writeCompressedTrailing can emit them as-is.
 func (w *erofsWriter) writeCompressedData(out io.Writer, e *erofsEntry) error {
-	if len(e.compressedData) == 0 {
+	if e.nPblks == 0 {
 		return nil
 	}
 	for idx := range e.lclusterEntries {
@@ -994,11 +1056,15 @@ func (w *erofsWriter) writeCompressedData(out io.Writer, e *erofsEntry) error {
 			le.pblk += e.dataBlkAddr
 		}
 	}
-	if _, err := out.Write(e.compressedData); err != nil {
-		return fmt.Errorf("write compressed data for %s: %w", e.path, err)
+	size := int64(e.nPblks) * int64(w.blockSize)
+	src := io.NewSectionReader(w.cspool, e.cspoolOff, size)
+	n, err := io.CopyBuffer(onlyWriter{out}, src, w.copyBuf)
+	if err != nil {
+		return fmt.Errorf("copy compressed data for %s: %w", e.path, err)
 	}
-	// Release the buffer once it's on disk.
-	e.compressedData = nil
+	if n != size {
+		return fmt.Errorf("short copy of compressed data for %s: got %d, want %d", e.path, n, size)
+	}
 	return nil
 }
 
