@@ -64,6 +64,14 @@ const (
 
 	SizeZErofsMapHeader     = 8
 	SizeZErofsLclusterIndex = 8
+
+	// MaxPclusterSize is the upper bound on a single pcluster's on-disk
+	// size in bytes, matching the kernel's Z_EROFS_PCLUSTER_MAX_SIZE
+	// (fs/erofs/erofs_fs.h). Used to bound buffer allocations on the read
+	// path so a corrupted (or malicious) lcluster index can't drive a
+	// huge allocation. 1 MiB is the kernel's absolute cap regardless of
+	// block size.
+	MaxPclusterSize = 1024 * 1024
 )
 
 // SuperBlock represents the EROFS on-disk superblock.

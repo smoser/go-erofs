@@ -502,6 +502,10 @@ func (img *image) fillExtent(fi *inode, ext *zextent, z *zmapState) error {
 		return fmt.Errorf("map device for nid %d: %w", fi.nid, err)
 	}
 
+	if ext.physicalSize <= 0 || ext.physicalSize > disk.MaxPclusterSize {
+		return fmt.Errorf("pcluster size %d out of range (max %d) for nid %d: %w",
+			ext.physicalSize, disk.MaxPclusterSize, fi.nid, ErrInvalid)
+	}
 	src := make([]byte, ext.physicalSize)
 	if _, err := reader.ReadAt(src, addr); err != nil {
 		return fmt.Errorf("read pcluster at %d for nid %d: %w", addr, fi.nid, err)
