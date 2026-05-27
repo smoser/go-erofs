@@ -662,6 +662,9 @@ func (fsys *Writer) Close() error {
 	}
 
 	ew.planLayout(root)
+	if err := ew.compressEntries(); err != nil {
+		return err
+	}
 	fixParentNids(root, root)
 
 	return ew.write(fsys.out)
@@ -1083,11 +1086,25 @@ type erofsEntry struct {
 	// Data block address for flat-plain files (full-image mode)
 	dataBlkAddr uint32
 
-	// Compressed regular file state. nLclusters is set during planLayout;
-	// lclusterTypes is filled during writeDataBlocks and consumed by
-	// writeCompressedTrailing.
-	nLclusters    uint32
-	lclusterTypes []uint8 // per-lcluster: Z_EROFS_LCLUSTER_TYPE_HEAD1 or _PLAIN
+	// Compressed regular file state. nLclusters is set during planLayout.
+	// compressEntry is called between planLayout and write: it fills
+	// compressedData (the on-disk pcluster bytes, exactly nPblks blocks),
+	// lclusterEntries (one entry per lcluster), and nPblks (the actual
+	// physical block count, which may be less than nLclusters when
+	// big-pcluster grouping wins).
+	nLclusters      uint32
+	nPblks          uint32
+	lclusterEntries []lclusterEntry
+	compressedData  []byte
+}
+
+// lclusterEntry captures the on-disk z_erofs_lcluster_index entry for one
+// logical cluster of a LayoutCompressedFull regular file.
+type lclusterEntry struct {
+	typ    uint8  // disk.ZErofsLclusterType{Plain,Head1,Nonhead}
+	pblk   uint32 // physical block address (for HEAD1 / PLAIN)
+	delta0 uint16 // lookback distance to HEAD, or (M | D0_CBLKCNT) for big-pcluster
+	delta1 uint16 // lookahead distance to the next HEAD
 }
 
 // --- Internal helpers ---

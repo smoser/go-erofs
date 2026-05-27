@@ -3847,3 +3847,67 @@ func TestReadAcceptsCompacted2BAdvise(t *testing.T) {
 	}
 	erofstest.CheckFileBytes(t, efs2, "file.bin", data)
 }
+
+// TestCreateFSCompressionBigPcluster verifies that compression with the big-
+// pcluster encoding actually shrinks images for compressible content and that
+// the result round-trips through the reader. Single-lcluster fallback for
+// incompressible content also keeps working.
+func TestCreateFSCompressionBigPcluster(t *testing.T) {
+	const blockSize = 4096
+
+	// Highly compressible: ~64 KiB of repeating text. The writer should
+	// group up to 4 lclusters per pcluster, so this file should land in
+	// roughly 64 KiB / 4 = 16 KiB of pclusters (plus index overhead).
+	bigCompressible := bytes.Repeat([]byte("the quick brown fox jumps over the lazy dog\n"), 1500)
+
+	// Incompressible: random-ish bytes that LZ4 can't shrink. Each lcluster
+	// must fall back to PLAIN; the on-disk size should not be much smaller
+	// than the input.
+	incompressible := make([]byte, 8*blockSize)
+	for i := range incompressible {
+		incompressible[i] = byte(i*1103515245 + 12345)
+	}
+
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithCompression(erofs.CompressionLZ4))
+	for _, c := range []struct {
+		path string
+		data []byte
+	}{
+		{"/big.txt", bigCompressible},
+		{"/rand.bin", incompressible},
+	} {
+		f, err := w.Create(c.path)
+		if err != nil {
+			t.Fatalf("Create %s: %v", c.path, err)
+		}
+		if _, err := f.Write(c.data); err != nil {
+			t.Fatalf("Write %s: %v", c.path, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close %s: %v", c.path, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Writer.Close:", err)
+	}
+
+	imgSize := int64(len(buf.Bytes()))
+	inputSize := int64(len(bigCompressible) + len(incompressible))
+	// big.txt is 66 KiB and should compress hugely; rand.bin is 32 KiB and
+	// stays roughly its size as PLAIN lclusters. An assertion that the
+	// image is at least ~30% smaller than the input is generous: with
+	// big-pcluster on, the compressible file alone should shrink ~4x.
+	if imgSize >= inputSize*7/10 {
+		t.Errorf("image size %d ≥ 70%% of input size %d — big-pcluster grouping didn't shrink output as expected", imgSize, inputSize)
+	}
+	t.Logf("image=%d bytes, input=%d bytes, ratio=%.1f%%",
+		imgSize, inputSize, 100*float64(imgSize)/float64(inputSize))
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	erofstest.CheckFileBytes(t, efs, "big.txt", bigCompressible)
+	erofstest.CheckFileBytes(t, efs, "rand.bin", incompressible)
+}

@@ -5,13 +5,19 @@ const (
 	SuperBlockOffset = 1024
 
 	FeatureIncompatLZ4_0Padding         = 0x1
+	// FeatureIncompatComprCfgs covers both the per-algorithm compression
+	// configuration area (placed right after the superblock) and the
+	// "big pcluster" capability — the kernel uses 0x02 for both.
+	FeatureIncompatComprCfgs            = 0x2
+	FeatureIncompatBigPcluster          = 0x2
 	FeatureIncompatChunkedFile          = 0x4
 	FeatureIncompatDeviceTable          = 0x8
 	FeatureIncompatFragments            = 0x20
 	FeatureIncompatXattrPrefixes        = 0x40
 	FeatureIncompatAll           uint32 = FeatureIncompatLZ4_0Padding |
-		FeatureIncompatChunkedFile | FeatureIncompatDeviceTable |
-		FeatureIncompatFragments | FeatureIncompatXattrPrefixes
+		FeatureIncompatComprCfgs | FeatureIncompatChunkedFile |
+		FeatureIncompatDeviceTable | FeatureIncompatFragments |
+		FeatureIncompatXattrPrefixes
 
 	SizeSuperBlock      = 128
 	SizeInodeCompact    = 32
@@ -64,6 +70,7 @@ const (
 
 	SizeZErofsMapHeader     = 8
 	SizeZErofsLclusterIndex = 8
+	SizeZErofsLZ4Cfgs       = 14 // struct z_erofs_lz4_cfgs (excludes 2-byte length prefix)
 
 	// MaxPclusterSize is the upper bound on a single pcluster's on-disk
 	// size in bytes, matching the kernel's Z_EROFS_PCLUSTER_MAX_SIZE

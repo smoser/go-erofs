@@ -47,14 +47,16 @@ type zextent struct {
 
 // maprec mirrors the kernel's z_erofs_maprecorder for a single lcluster.
 type maprec struct {
-	lcn         uint32
-	typ         uint8 // Z_EROFS_LCLUSTER_TYPE_*
-	clusterOfs  uint16
-	pblk        uint32
-	delta       [2]uint16
-	cblkcnt     uint32 // compressed block count when D0_CBLKCNT is set
-	partialRef  bool
-	headType    uint8 // set after a successful lookback walk
+	lcn        uint32
+	typ        uint8 // Z_EROFS_LCLUSTER_TYPE_*
+	clusterOfs uint16
+	pblk       uint32
+	delta      [2]uint16
+	// compressedBlks is set when CBLKCNT is decoded on a NONHEAD lcluster;
+	// it carries the on-disk block count of the preceding pcluster.
+	compressedBlks uint32
+	partialRef     bool
+	headType       uint8 // set after a successful lookback walk
 }
 
 // zmapInit reads the inode's z_erofs_map_header and validates that the
@@ -87,8 +89,10 @@ func (img *image) zmapInitLocked(fi *inode, z *zmapState) error {
 	//
 	// Compacted2B is the layout hint for the compact lcluster index — it
 	// just says the index uses a 2-byte-per-entry run in addition to the
-	// 4-byte run, and the compact decoder consults it directly. Accept it.
-	const acceptedAdvise = uint16(disk.ZErofsAdviseCompacted2B)
+	// 4-byte run, and the compact decoder consults it directly.
+	// BigPcluster1 enables multi-block pclusters for HEAD1 lclusters,
+	// signalled per-pcluster via the CBLKCNT marker on the first NONHEAD.
+	const acceptedAdvise = uint16(disk.ZErofsAdviseCompacted2B | disk.ZErofsAdviseBigPcluster1)
 	if unsupported := h.HAdvise &^ acceptedAdvise; unsupported != 0 {
 		// Map specific bits to clearer messages.
 		switch {
@@ -96,9 +100,8 @@ func (img *image) zmapInitLocked(fi *inode, z *zmapState) error {
 			return fmt.Errorf("fragment pcluster: %w", ErrNotImplemented)
 		case h.HAdvise&disk.ZErofsAdviseInlinePcluster != 0:
 			return fmt.Errorf("inline pcluster (tail-packing): %w", ErrNotImplemented)
-		case h.HAdvise&disk.ZErofsAdviseBigPcluster1 != 0,
-			h.HAdvise&disk.ZErofsAdviseBigPcluster2 != 0:
-			return fmt.Errorf("big pcluster: %w", ErrNotImplemented)
+		case h.HAdvise&disk.ZErofsAdviseBigPcluster2 != 0:
+			return fmt.Errorf("big pcluster 2 (HEAD2): %w", ErrNotImplemented)
 		case h.HAdvise&disk.ZErofsAdviseInterlacedPcluster != 0:
 			return fmt.Errorf("interlaced pcluster: %w", ErrNotImplemented)
 		}
@@ -163,7 +166,7 @@ func (img *image) loadFullLcluster(z *zmapState, lcn uint32, m *maprec) error {
 	}
 
 	m.lcn = lcn
-	m.cblkcnt = 0
+	m.compressedBlks = 0
 	m.partialRef = false
 	advise := li.DiAdvise
 	m.typ = uint8(advise & disk.ZErofsLclusterTypeMask)
@@ -172,8 +175,14 @@ func (img *image) loadFullLcluster(z *zmapState, lcn uint32, m *maprec) error {
 		m.delta[0] = uint16(li.DiU & 0xFFFF)
 		m.delta[1] = uint16(li.DiU >> 16)
 		if m.delta[0]&disk.ZErofsLiD0CblkCnt != 0 {
-			// Big-pcluster signalling — we don't support it.
-			return fmt.Errorf("big-pcluster CBLKCNT: %w", ErrNotImplemented)
+			// Big-pcluster CBLKCNT: delta[0] carries the on-disk block
+			// count of the preceding pcluster (low 11 bits) and the
+			// implicit lookback distance to the HEAD is 1.
+			if z.advise&disk.ZErofsAdviseBigPcluster1 == 0 {
+				return fmt.Errorf("CBLKCNT without BIG_PCLUSTER_1 advise: %w", ErrInvalid)
+			}
+			m.compressedBlks = uint32(m.delta[0]) &^ disk.ZErofsLiD0CblkCnt
+			m.delta[0] = 1
 		}
 	} else {
 		m.partialRef = advise&disk.ZErofsLiPartialRef != 0
@@ -198,7 +207,7 @@ func (img *image) loadCompactLcluster(z *zmapState, lcn uint32, lookahead bool, 
 	lclusterBits := z.lclusterBits
 
 	m.lcn = lcn
-	m.cblkcnt = 0
+	m.compressedBlks = 0
 	m.partialRef = false
 
 	// compacted_4b_initial aligns the start of the compact_2b run (if any)
@@ -422,6 +431,16 @@ func (img *image) zmapLookup(fi *inode, ofs int64) (zextent, error) {
 		return zextent{}, err
 	}
 
+	// Walk forward via delta[1] to find the next HEAD/PLAIN (or EOF) — that
+	// terminator's clusterofs marks the partial-tail end of this extent.
+	// Single-lcluster pclusters get exactly one lcluster's worth; multi-
+	// lcluster extents (big-pcluster or dedup'd) cover several.
+	endByte, err := img.extentDecompressedEnd(fi, z, headLcn)
+	if err != nil {
+		return zextent{}, err
+	}
+	end = endByte
+
 	blockSize := int64(1) << img.sb.BlkSizeBits
 	ext := zextent{
 		logicalStart:  logicalStart,
@@ -443,13 +462,76 @@ func (img *image) zmapLookup(fi *inode, ofs int64) (zextent, error) {
 	return ext, nil
 }
 
+// extentDecompressedEnd walks the lcluster index forward from headLcn using
+// delta[1] until it lands on a new HEAD/PLAIN (or runs off the end of the
+// file). Returns the logical end byte offset of the current extent —
+// i.e., (next_HEAD_lcn << lclusterBits) + next_HEAD.clusterofs. The
+// terminating HEAD/PLAIN may carry a non-zero clusterofs (signalling the
+// previous extent's partial tail), so we can't just round to a whole
+// lcluster.
+//
+// Mirrors z_erofs_get_extent_decompressedlen in fs/erofs/zmap.c.
+func (img *image) extentDecompressedEnd(fi *inode, z *zmapState, headLcn uint32) (int64, error) {
+	lcn := headLcn
+	for {
+		if int64(lcn)<<z.lclusterBits >= fi.size {
+			return fi.size, nil
+		}
+		if lcn >= z.totalLcn {
+			return int64(z.totalLcn) << z.lclusterBits, nil
+		}
+		var m maprec
+		if err := img.loadLcluster(fi, z, lcn, true, &m); err != nil {
+			return 0, err
+		}
+		switch m.typ {
+		case disk.ZErofsLclusterTypeNonhead:
+			d1 := m.delta[1]
+			if d1 == 0 {
+				d1 = 1 // workaround for older mkfs.erofs that wrote d1=0
+			}
+			lcn += uint32(d1)
+		default:
+			if lcn != headLcn {
+				return int64(lcn)<<z.lclusterBits + int64(m.clusterOfs), nil
+			}
+			// First HEAD — start the walk one ahead.
+			lcn++
+		}
+	}
+}
+
 // extentCompressedLen returns the on-disk block count of the pcluster anchored
-// at m. Without big-pcluster support this is always 1.
+// at the HEAD lcluster in m. Mirrors z_erofs_get_extent_compressedlen in
+// fs/erofs/zmap.c — for big-pcluster images the count is recovered from the
+// CBLKCNT marker on the first NONHEAD lcluster that follows m.
 func (img *image) extentCompressedLen(fi *inode, z *zmapState, m *maprec) (uint32, error) {
-	// big-pcluster is not supported, so every HEAD pcluster is exactly one block.
-	_ = fi
-	_ = z
-	_ = m
+	// HEAD2 / PLAIN big-pcluster (BIG_PCLUSTER_2) isn't implemented in the
+	// writer, and the reader rejects the advise bit, so anything other than
+	// a HEAD1 anchored pcluster in big-pcluster mode is unambiguously 1 block.
+	if z.advise&disk.ZErofsAdviseBigPcluster1 == 0 ||
+		m.headType != disk.ZErofsLclusterTypeHead1 {
+		return 1, nil
+	}
+	nextLcn := m.lcn + 1
+	if int64(nextLcn)<<z.lclusterBits >= fi.size {
+		// HEAD is the last lcluster of the file — exactly one block.
+		return 1, nil
+	}
+
+	// Re-use the caller's maprec for the next lcluster; the caller doesn't
+	// reuse m after this point in the lookup path.
+	var next maprec
+	if err := img.loadLcluster(fi, z, nextLcn, false, &next); err != nil {
+		return 0, err
+	}
+	if next.typ == disk.ZErofsLclusterTypeNonhead && next.compressedBlks > 0 {
+		return next.compressedBlks, nil
+	}
+	// The next lcluster is either a fresh HEAD/PLAIN (new pcluster) or a
+	// NONHEAD without CBLKCNT — either way, the current pcluster is one
+	// block. Matches the kernel's "if (m->type != NONHEAD || !compressedblks)"
+	// fallback.
 	return 1, nil
 }
 

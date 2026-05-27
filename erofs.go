@@ -230,9 +230,16 @@ func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 	// LZ4_0Padding feature flag is a hint about the on-disk layout (the
 	// encoder may insert leading zero bytes in a pcluster) and is accepted
 	// unconditionally.
-	const supportedAlgs = uint16(1 << disk.ZErofsCompressionLZ4)
-	if unsupported := i.sb.ComprAlgs &^ supportedAlgs; unsupported != 0 {
-		return nil, fmt.Errorf("unsupported compression algorithms 0x%x: %w", unsupported, ErrNotImplemented)
+	//
+	// ComprAlgs is the same struct field as lz4_max_distance: it's a bitmap
+	// of available algorithms only when FEATURE_INCOMPAT_COMPR_CFGS is set;
+	// otherwise it carries the LZ4 max sliding distance and any bit pattern
+	// is legal.
+	if i.sb.FeatureIncompat&disk.FeatureIncompatComprCfgs != 0 {
+		const supportedAlgs = uint16(1 << disk.ZErofsCompressionLZ4)
+		if unsupported := i.sb.ComprAlgs &^ supportedAlgs; unsupported != 0 {
+			return nil, fmt.Errorf("unsupported compression algorithms 0x%x: %w", unsupported, ErrNotImplemented)
+		}
 	}
 
 	i.blkPool.New = func() any {
