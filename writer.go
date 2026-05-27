@@ -856,6 +856,15 @@ func (w *erofsWriter) flatPlainDataSize(e *erofsEntry) int {
 // block) and surfaces the choice via the lz4_cfgs.max_pclusterblks field.
 const maxPclusterLclusters = 4
 
+// Compile-time guard: the on-disk CBLKCNT marker encodes the pcluster's
+// physical block count in 11 bits of NONHEAD di_u.delta[0] (the high bit at
+// ZErofsLiD0CblkCnt = 0x800 is the marker itself, the low 11 bits hold the
+// value). If maxPclusterLclusters ever exceeds 0x7FF (= ZErofsLiD0CblkCnt-1)
+// the OR in compressEntry would clobber the marker bit and emit a corrupt
+// index entry. Make the conversion below fail at build time before that
+// happens; if you legitimately need a larger value, widen the encoding.
+var _ [int(disk.ZErofsLiD0CblkCnt) - maxPclusterLclusters]struct{}
+
 // compressEntries walks all entries and pre-compresses any LayoutCompressedFull
 // regular files into the shared cspool tempfile. After this returns, each
 // compressed entry has its cspoolOff (start offset in the spool), nPblks
