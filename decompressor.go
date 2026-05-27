@@ -92,11 +92,16 @@ func lz4UncompressPartial(dst, src []byte) (int, error) {
 		offset := int(src[si]) | int(src[si+1])<<8
 		si += 2
 		if offset == 0 {
-			// Zero offset is invalid in real LZ4 data and is what zero
-			// padding decodes to once the literal section is exhausted.
-			// Treat it as the end of meaningful output rather than a
-			// hard error so pclusters padded with zeros behave like the
-			// kernel's partial decoder.
+			// Offset 0 is invalid in real LZ4 data and is what trailing
+			// zero padding decodes to once we've stepped past the natural
+			// end of the LZ4 stream. Treat it as end-of-stream only if we
+			// have already produced the full requested output — otherwise
+			// it's a truncated stream that happens to have zero bytes
+			// where the offset field would be, and silently returning a
+			// short decode would mask real corruption.
+			if di < len(dst) {
+				return 0, fmt.Errorf("lz4: zero match offset before end of output (%d/%d bytes decoded)", di, len(dst))
+			}
 			return di, nil
 		}
 		if offset > di {
