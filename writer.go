@@ -39,6 +39,12 @@ type erofsWriter struct {
 	inodeBuf    [disk.SizeInodeExtended]byte // scratch buffer for writeInode
 	compression Compression                  // compression algorithm for regular file data
 
+	// Compressor cache, resolved once when the writer needs to compress its
+	// first entry. comp is nil and algoID is 0 when compression == CompressionNone.
+	compResolved bool
+	algoID       uint8
+	comp         compressor
+
 	// cspool holds the compressed bytes for every LayoutCompressedFull entry,
 	// appended sequentially during compressEntries and copied back to the
 	// output during writeDataBlocks. Using a tempfile (rather than a per-
@@ -81,6 +87,24 @@ func (w *erofsWriter) minChunkBits(size uint64) uint8 {
 		bits++
 	}
 	return bits
+}
+
+// resolveCompressor populates w.algoID and w.comp from w.compression on the
+// first call. Subsequent calls are no-ops. Callers that don't actually need
+// the compressor (e.g., when there are no compressed entries) never invoke
+// it. Returns an error only for unsupported algorithms.
+func (w *erofsWriter) resolveCompressor() error {
+	if w.compResolved {
+		return nil
+	}
+	algoID, comp, err := pickCompressor(w.compression)
+	if err != nil {
+		return err
+	}
+	w.algoID = algoID
+	w.comp = comp
+	w.compResolved = true
+	return nil
 }
 
 func (w *erofsWriter) write(out io.WriteSeeker) error {
@@ -258,8 +282,7 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 		}
 		if e.layout == disk.LayoutCompressedFull {
 			featureIncompat |= disk.FeatureIncompatLZ4_0Padding
-			algoID, _, _ := pickCompressor(w.compression)
-			comprAlgs |= 1 << algoID
+			comprAlgs |= 1 << w.algoID
 			// The kernel rejects images that use BIG_PCLUSTER_1 advise
 			// without the matching superblock feature bit ("per-inode
 			// big pcluster without sb feature" → -EFSCORRUPTED, see
@@ -539,19 +562,16 @@ func (w *erofsWriter) writeCompressedTrailing(buf io.Writer, e *erofsEntry) erro
 
 	// z_erofs_map_header: clusterbits=0 (lcluster=blocksize),
 	// algorithmtype in the low nibble, h_advise carries BIG_PCLUSTER_1 if
-	// any pcluster spans more than one block.
-	algoID, _, err := pickCompressor(w.compression)
-	if err != nil {
-		return err
-	}
+	// any pcluster spans more than one block. The compressor was resolved
+	// during compressEntries so w.algoID is already set here.
 	var hAdvise uint16
 	if entryHasBigPcluster(e) {
 		hAdvise |= disk.ZErofsAdviseBigPcluster1
 	}
 	var hdr [disk.SizeZErofsMapHeader]byte
 	binary.LittleEndian.PutUint16(hdr[4:6], hAdvise)
-	hdr[6] = algoID // h_algorithmtype: low nibble = HEAD1 algo
-	hdr[7] = 0      // h_clusterbits: lcluster_bits = blockSize_bits + 0
+	hdr[6] = w.algoID // h_algorithmtype: low nibble = HEAD1 algo
+	hdr[7] = 0        // h_clusterbits: lcluster_bits = blockSize_bits + 0
 	if _, err := buf.Write(hdr[:]); err != nil {
 		return err
 	}
@@ -844,6 +864,23 @@ const maxPclusterLclusters = 4
 // the real on-disk size. The cspool itself is unlinked on creation and
 // freed automatically when the writer closes it via closeCspool().
 func (w *erofsWriter) compressEntries() error {
+	// Resolve the compressor once. If no entry is compressed we skip the
+	// resolve and the writer's algoID/comp stay zero — that's fine because
+	// writeBlock0/writeCompressedTrailing only read them when at least one
+	// entry has LayoutCompressedFull.
+	hasCompressed := false
+	for _, e := range w.entries {
+		if e.layout == disk.LayoutCompressedFull {
+			hasCompressed = true
+			break
+		}
+	}
+	if !hasCompressed {
+		return nil
+	}
+	if err := w.resolveCompressor(); err != nil {
+		return fmt.Errorf("resolve compressor: %w", err)
+	}
 	for _, e := range w.entries {
 		if e.layout != disk.LayoutCompressedFull {
 			continue
@@ -904,10 +941,6 @@ func (w *erofsWriter) compressEntry(e *erofsEntry) error {
 	if e.size == 0 || e.data == nil {
 		return nil
 	}
-	_, comp, err := pickCompressor(w.compression)
-	if err != nil {
-		return fmt.Errorf("compressor for %s: %w", e.path, err)
-	}
 	defer func() {
 		if c, ok := e.data.(io.Closer); ok {
 			_ = c.Close()
@@ -959,7 +992,7 @@ func (w *erofsWriter) compressEntry(e *erofsEntry) error {
 		// If the result fits in fewer than k blocks, emit the multi-lcluster
 		// pcluster. Skip when k == 1 (degenerates to the per-lcluster path).
 		if k > 1 {
-			n, err := comp.compressBlock(rawBatch[:batchBytes], compressedBatch)
+			n, err := w.comp.compressBlock(rawBatch[:batchBytes], compressedBatch)
 			if err != nil {
 				return fmt.Errorf("compress batch for %s: %w", e.path, err)
 			}
@@ -1003,7 +1036,7 @@ func (w *erofsWriter) compressEntry(e *erofsEntry) error {
 		// Per-lcluster fallback: process each of the k blocks individually.
 		for j := 0; j < k; j++ {
 			block := rawBatch[j*bs : (j+1)*bs]
-			n, err := comp.compressBlock(block, compressed)
+			n, err := w.comp.compressBlock(block, compressed)
 			if err != nil {
 				return fmt.Errorf("compress block for %s: %w", e.path, err)
 			}
