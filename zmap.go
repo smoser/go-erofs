@@ -279,9 +279,16 @@ func (img *image) loadCompactLcluster(z *zmapState, lcn uint32, lookahead bool, 
 		return fmt.Errorf("compact lcn: clusterofs %d > lcluster size: %w", m.clusterOfs, ErrInvalid)
 	}
 
-	// Compute the HEAD pblk by walking forward from the pack base, counting
-	// the number of HEAD lclusters before this one within the pack. The
-	// pack's trailing 32-bit field stores the first HEAD's pblk.
+	// Compute the HEAD pblk for entry i within the pack.
+	//
+	// Mirrors the non-big-pcluster branch of kernel z_erofs_load_compact_lcluster
+	// (fs/erofs/zmap.c:200-211). The pack's trailing 32-bit field stores
+	// `first_HEAD_pblk - 1`, not the first HEAD's pblk directly — i.e. the
+	// formula is `pblk_for_entry_i = base + nblk` where nblk starts at 1
+	// and increments once per HEAD-lcluster predecessor (NONHEADs jump
+	// back to the HEAD they reference). For i == 0 (we are the first HEAD)
+	// the loop never runs, nblk stays at 1, and we recover the first HEAD's
+	// real pblk = base + 1.
 	var nblk uint32 = 1
 	for j := int(i) - 1; j >= 0; j-- {
 		lo2, typ2 := decodeCompactedBits(lobits, pack, encodebits*uint(j))

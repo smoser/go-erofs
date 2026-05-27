@@ -65,14 +65,27 @@ func TestErofs(t *testing.T) {
 	})
 
 	// Compressed images produced by stock mkfs.erofs -zlz4 must round-trip.
+	// Covers both the trivial single-block file and a multi-block compressible
+	// file whose lcluster index actually exercises the compact-mode pblk
+	// walkback loop and (for big enough inputs) the compacted_2b run.
 	t.Run("lz4-mkfs-roundtrip", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("mkfs.erofs compression is not included on Windows")
 		}
-		const content = "this is the file content that will be compressed by lz4\n"
+		const single = "this is the file content that will be compressed by lz4\n"
+		// ~256 KiB of highly compressible repeating data — large enough that
+		// at 4 KiB blocks the compact index needs many lclusters, and the
+		// COMPACTED_2B advise bit gets set on the trailing pack(s).
+		bigPattern := bytes.Repeat([]byte("the quick brown fox jumps over the lazy dog\n"), 6000)
+		// Mixed content: a file with a partial tail to exercise tail clamping
+		// through the compact decoder.
+		tailed := append(bytes.Repeat([]byte("ABCDEFGHIJKLMNOP"), 4096), []byte("tail bytes\n")...)
+
 		tc := erofstest.TarContext{}
 		wt := erofstest.TarAll(
-			tc.File("/file.txt", []byte(content), 0644),
+			tc.File("/file.txt", []byte(single), 0644),
+			tc.File("/big.txt", bigPattern, 0644),
+			tc.File("/tailed.bin", tailed, 0644),
 		)
 		tarStream := erofstest.TarFromWriterTo(wt)
 		defer func() {
@@ -100,7 +113,9 @@ func TestErofs(t *testing.T) {
 		if err != nil {
 			t.Fatal("Open compressed image:", err)
 		}
-		erofstest.CheckFile(t, efs, "file.txt", content)
+		erofstest.CheckFile(t, efs, "file.txt", single)
+		erofstest.CheckFileBytes(t, efs, "big.txt", bigPattern)
+		erofstest.CheckFileBytes(t, efs, "tailed.bin", tailed)
 	})
 }
 
