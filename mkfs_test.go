@@ -3705,3 +3705,71 @@ func TestCopyFromHardlinkRequiresSameDev(t *testing.T) {
 		t.Errorf("a ino %d == b ino %d: same Ino but different Dev must not be coalesced", aSt.Ino, bSt.Ino)
 	}
 }
+
+// TestCreateFSCompressionLZ4 round-trips files through the LZ4 writer and
+// reader. It exercises three classes of regular file:
+//   - small file that still uses inline layout (compression is skipped),
+//   - highly compressible large file (HEAD1 lclusters),
+//   - incompressible large file (PLAIN lclusters via the writer's fallback).
+//
+// Self-contained: does not require mkfs.erofs / fsck.erofs.
+func TestCreateFSCompressionLZ4(t *testing.T) {
+	const blockSize = 4096
+
+	tiny := []byte("inline-me\n")
+	// 5 blocks worth of highly compressible repeating data.
+	compressible := bytes.Repeat([]byte("ABCDEFGHIJKLMNOP"), 5*blockSize/16)
+	// 2 blocks of random-ish data that won't fit when compressed; the
+	// writer should fall back to PLAIN lclusters and still round-trip.
+	incompressible := make([]byte, 2*blockSize)
+	for i := range incompressible {
+		// Use the low byte of a multiplier to spread values; avoid Go's
+		// math/rand to keep the test deterministic without seeding.
+		incompressible[i] = byte(i*1103515245 + 12345)
+	}
+	// 1 block exact + 13 bytes — exercises the partial tail lcluster.
+	tailed := append(bytes.Repeat([]byte("hello compression world\n"), blockSize/24), []byte("trailing bytes")...)
+
+	// Multi-block (10 blocks exact) compressible file — exercises many
+	// sequential lcluster decodes with cache reuse and no tail clamp.
+	bigCompressible := bytes.Repeat([]byte("0123456789ABCDEF"), 10*blockSize/16)
+
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithCompression(erofs.CompressionLZ4))
+
+	for _, c := range []struct {
+		path string
+		data []byte
+	}{
+		{"/tiny.txt", tiny},
+		{"/compressible.bin", compressible},
+		{"/incompressible.bin", incompressible},
+		{"/tailed.bin", tailed},
+		{"/big-compressible.bin", bigCompressible},
+	} {
+		f, err := w.Create(c.path)
+		if err != nil {
+			t.Fatalf("Create %s: %v", c.path, err)
+		}
+		if _, err := f.Write(c.data); err != nil {
+			t.Fatalf("Write %s: %v", c.path, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close file %s: %v", c.path, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Writer.Close:", err)
+	}
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	erofstest.CheckFileBytes(t, efs, "tiny.txt", tiny)
+	erofstest.CheckFileBytes(t, efs, "compressible.bin", compressible)
+	erofstest.CheckFileBytes(t, efs, "incompressible.bin", incompressible)
+	erofstest.CheckFileBytes(t, efs, "tailed.bin", tailed)
+	erofstest.CheckFileBytes(t, efs, "big-compressible.bin", bigCompressible)
+}

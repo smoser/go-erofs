@@ -37,6 +37,7 @@ type erofsWriter struct {
 	copyBuf     []byte                       // reusable buffer for io.CopyBuffer
 	zeroBuf     []byte                       // blockSize-length zero buffer for padding
 	inodeBuf    [disk.SizeInodeExtended]byte // scratch buffer for writeInode
+	compression Compression                  // compression algorithm for regular file data
 }
 
 // inodeSize returns the on-disk inode header size for e.
@@ -160,24 +161,18 @@ func (w *erofsWriter) assignDataBlocks() {
 		metaBlocks := (totalMetaBytes + w.blockSize - 1) / w.blockSize
 		addr := uint32(w.sbAreaBlocks() + metaBlocks)
 		for _, e := range w.entries {
-			if e.hardLinkPrimary != nil {
-				continue
-			}
-			if ds := w.flatPlainDataSize(e); ds > 0 {
+			if nblk := w.entryDataBlocks(e); nblk > 0 {
 				e.dataBlkAddr = addr
-				addr += uint32((ds + w.blockSize - 1) / w.blockSize)
+				addr += uint32(nblk)
 			}
 		}
 	} else {
 		// Data-first: data starts after superblock area.
 		addr := uint32(w.sbAreaBlocks())
 		for _, e := range w.entries {
-			if e.hardLinkPrimary != nil {
-				continue // secondary entries share the primary's data blocks
-			}
-			if ds := w.flatPlainDataSize(e); ds > 0 {
+			if nblk := w.entryDataBlocks(e); nblk > 0 {
 				e.dataBlkAddr = addr
-				addr += uint32((ds + w.blockSize - 1) / w.blockSize)
+				addr += uint32(nblk)
 			}
 		}
 		w.metaBlkAddr = addr // metadata follows data
@@ -228,15 +223,10 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 	totalMetaBytes := w.metadataBytes()
 	metaBlocks := (totalMetaBytes + w.blockSize - 1) / w.blockSize
 
-	// Count data blocks (skip secondary hard-link entries).
+	// Count data blocks (flat-plain plus compressed pclusters).
 	dataBlocks := 0
 	for _, e := range w.entries {
-		if e.hardLinkPrimary != nil {
-			continue
-		}
-		if ds := w.flatPlainDataSize(e); ds > 0 {
-			dataBlocks += (ds + w.blockSize - 1) / w.blockSize
-		}
+		dataBlocks += w.entryDataBlocks(e)
 	}
 	totalBlocks := w.sbAreaBlocks() + metaBlocks + dataBlocks
 
@@ -249,10 +239,15 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 		extraDevices = uint16(len(w.devices))
 		devtSlotOff = uint16(disk.SizeSuperBlock / 16)
 	}
+	var comprAlgs uint16
 	for _, e := range w.entries {
 		if len(e.chunks) > 0 {
 			featureIncompat |= disk.FeatureIncompatChunkedFile
-			break
+		}
+		if e.layout == disk.LayoutCompressedFull {
+			featureIncompat |= disk.FeatureIncompatLZ4_0Padding
+			algoID, _, _ := pickCompressor(w.compression)
+			comprAlgs |= 1 << algoID
 		}
 	}
 
@@ -266,6 +261,7 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 		Blocks:          uint32(totalBlocks),
 		MetaBlkAddr:     w.metaBlkAddr,
 		FeatureIncompat: featureIncompat,
+		ComprAlgs:       comprAlgs,
 		ExtraDevices:    extraDevices,
 		DevtSlotOff:     devtSlotOff,
 	}
@@ -346,6 +342,11 @@ func (w *erofsWriter) writeMetadataInodes(buf io.Writer) error {
 					return fmt.Errorf("write chunks for %s: %w", e.path, err)
 				}
 				metaStart += e.trailingSize
+			} else if e.layout == disk.LayoutCompressedFull {
+				if err := w.writeCompressedTrailing(buf, e); err != nil {
+					return fmt.Errorf("write compressed metadata for %s: %w", e.path, err)
+				}
+				metaStart += e.trailingSize
 			} else if e.layout == disk.LayoutFlatInline && e.size > 0 && e.data != nil {
 				// e.data may be an unbounded reader (e.g. directData from CopyFrom);
 				// limit to e.size bytes to prevent overwriting subsequent metadata.
@@ -415,6 +416,8 @@ func (w *erofsWriter) writeInode(buf io.Writer, e *erofsEntry) error {
 		} else if e.layout == disk.LayoutFlatPlain && e.size > 0 {
 			inodeData = e.dataBlkAddr
 		}
+		// LayoutCompressedFull leaves inodeData=0; the algorithm and
+		// block addresses live in the trailing map header + lcluster index.
 	case disk.StatTypeDir, disk.StatTypeSymlink:
 		if e.layout == disk.LayoutFlatPlain {
 			inodeData = e.dataBlkAddr
@@ -493,6 +496,55 @@ func (w *erofsWriter) writeXattrs(buf io.Writer, e *erofsEntry) error {
 			if _, err := buf.Write(w.zeroBuf[:4-entryLen%4]); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+// writeCompressedTrailing emits the on-disk trailing area for a
+// LayoutCompressedFull inode: alignment padding, the z_erofs_map_header,
+// the reserved 8-byte slot before the lcluster index, and one
+// z_erofs_lcluster_index entry per logical cluster.
+//
+// Each lcluster maps to exactly one physical block (no big-pcluster); the
+// block address is e.dataBlkAddr + lclusterIndex. Type comes from
+// e.lclusterTypes which writeCompressedData populated.
+func (w *erofsWriter) writeCompressedTrailing(buf io.Writer, e *erofsEntry) error {
+	headerSize := inodeCoreSize(e) + e.xattrSize
+	alignPad := (8 - (headerSize % 8)) % 8
+	if alignPad > 0 {
+		if _, err := buf.Write(w.zeroBuf[:alignPad]); err != nil {
+			return err
+		}
+	}
+
+	// z_erofs_map_header: 8 bytes. clusterbits=0 (lcluster=blocksize),
+	// algorithmtype=LZ4 in low nibble, h_advise=0, fragmentoff=0.
+	algoID, _, err := pickCompressor(w.compression)
+	if err != nil {
+		return err
+	}
+	var hdr [disk.SizeZErofsMapHeader]byte
+	hdr[6] = algoID // h_algorithmtype: low nibble = HEAD1 algo
+	hdr[7] = 0      // h_clusterbits: lcluster_bits = blockSize_bits + 0
+	if _, err := buf.Write(hdr[:]); err != nil {
+		return err
+	}
+
+	// 8 bytes reserved gap (Z_EROFS_FULL_INDEX_START = MAP_HEADER_END + 8).
+	if _, err := buf.Write(w.zeroBuf[:8]); err != nil {
+		return err
+	}
+
+	// One z_erofs_lcluster_index per lcluster.
+	var li [disk.SizeZErofsLclusterIndex]byte
+	for i := uint32(0); i < e.nLclusters; i++ {
+		typ := e.lclusterTypes[i]
+		binary.LittleEndian.PutUint16(li[0:2], uint16(typ)) // di_advise (type in low bits)
+		binary.LittleEndian.PutUint16(li[2:4], 0)           // di_clusterofs = 0
+		binary.LittleEndian.PutUint32(li[4:8], e.dataBlkAddr+i)
+		if _, err := buf.Write(li[:]); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -656,6 +708,12 @@ func (w *erofsWriter) writeDataBlocks(out io.Writer) error {
 		if e.hardLinkPrimary != nil {
 			continue // secondary hard-link entries share the primary's data blocks
 		}
+		if e.layout == disk.LayoutCompressedFull {
+			if err := w.writeCompressedData(out, e); err != nil {
+				return err
+			}
+			continue
+		}
 		ds := w.flatPlainDataSize(e)
 		if ds == 0 {
 			continue
@@ -722,6 +780,100 @@ func (w *erofsWriter) flatPlainDataSize(e *erofsEntry) int {
 		return w.direntDataSize(e)
 	case disk.StatTypeSymlink:
 		return len(e.symTarget)
+	}
+	return 0
+}
+
+// writeCompressedData compresses a regular file's data in blockSize-sized
+// chunks and writes one physical block per lcluster. For each chunk, if LZ4
+// produces output smaller than blockSize the block is HEAD1 (compressed,
+// zero-padded to a full block); otherwise the raw bytes are emitted as a
+// PLAIN lcluster. Per-block decisions are recorded in e.lclusterTypes and
+// consumed later by writeCompressedTrailing.
+func (w *erofsWriter) writeCompressedData(out io.Writer, e *erofsEntry) error {
+	if e.size == 0 || e.data == nil {
+		return nil
+	}
+	_, comp, err := pickCompressor(w.compression)
+	if err != nil {
+		return fmt.Errorf("compressor for %s: %w", e.path, err)
+	}
+
+	nlcn := int(e.nLclusters)
+	e.lclusterTypes = make([]uint8, nlcn)
+
+	raw := make([]byte, w.blockSize)
+	compressed := make([]byte, w.blockSize)
+	zero := w.zeroBuf
+
+	remaining := int64(e.size)
+	for i := 0; i < nlcn; i++ {
+		want := int64(w.blockSize)
+		if want > remaining {
+			want = remaining
+		}
+		if _, err := io.ReadFull(e.data, raw[:want]); err != nil {
+			return fmt.Errorf("read data for %s: %w", e.path, err)
+		}
+		remaining -= want
+
+		// Zero any bytes in the last partial block beyond the file size so
+		// compression operates on a deterministic blockSize-sized input.
+		// Trying to compress only `want` bytes would still produce valid
+		// LZ4 output, but mkfs.erofs compresses the full lcluster size when
+		// big_pcluster is off; we match that.
+		if want < int64(w.blockSize) {
+			for j := int(want); j < w.blockSize; j++ {
+				raw[j] = 0
+			}
+		}
+
+		n, err := comp.compressBlock(compressed, raw)
+		if err != nil {
+			return fmt.Errorf("compress data for %s: %w", e.path, err)
+		}
+		// Treat n==0 (LZ4 inflation) or "doesn't fit smaller" as plain.
+		if n <= 0 || n >= w.blockSize {
+			e.lclusterTypes[i] = disk.ZErofsLclusterTypePlain
+			if _, err := out.Write(raw); err != nil {
+				return fmt.Errorf("write plain block for %s: %w", e.path, err)
+			}
+			continue
+		}
+		e.lclusterTypes[i] = disk.ZErofsLclusterTypeHead1
+		if _, err := out.Write(compressed[:n]); err != nil {
+			return fmt.Errorf("write compressed block for %s: %w", e.path, err)
+		}
+		if pad := w.blockSize - n; pad > 0 {
+			if _, err := out.Write(zero[:pad]); err != nil {
+				return fmt.Errorf("write pad for %s: %w", e.path, err)
+			}
+		}
+	}
+
+	if c, ok := e.data.(io.Closer); ok {
+		_ = c.Close()
+	}
+	return nil
+}
+
+// entryDataBlocks returns the number of physical data blocks an entry will
+// occupy outside the metadata area. Used to size the on-disk data section
+// for block-address assignment and superblock accounting.
+func (w *erofsWriter) entryDataBlocks(e *erofsEntry) int {
+	if e.hardLinkPrimary != nil {
+		return 0 // secondary entries share the primary's data blocks
+	}
+	switch e.layout {
+	case disk.LayoutFlatPlain:
+		ds := w.flatPlainDataSize(e)
+		if ds == 0 {
+			return 0
+		}
+		return (ds + w.blockSize - 1) / w.blockSize
+	case disk.LayoutCompressedFull:
+		// One physical block per lcluster (no big-pcluster support).
+		return int(e.nLclusters)
 	}
 	return 0
 }

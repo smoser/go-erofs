@@ -31,6 +31,39 @@ const (
 	LayoutChunkFormatBits    = 0x001F
 	LayoutChunkFormatIndexes = 0x0020
 	LayoutChunkFormat48Bit   = 0x0040
+
+	// Compression algorithm identifiers stored in ZErofsMapHeader.AlgorithmType
+	// and indexed as bit positions in SuperBlock.ComprAlgs.
+	ZErofsCompressionLZ4     = 0
+	ZErofsCompressionLZMA    = 1
+	ZErofsCompressionDeflate = 2
+	ZErofsCompressionZstd    = 3
+	ZErofsCompressionMax     = 4
+
+	// Bit flags in ZErofsMapHeader.HAdvise.
+	ZErofsAdviseCompacted2B        = 0x0001
+	ZErofsAdviseBigPcluster1       = 0x0002
+	ZErofsAdviseBigPcluster2       = 0x0004
+	ZErofsAdviseInlinePcluster     = 0x0008
+	ZErofsAdviseInterlacedPcluster = 0x0010
+	ZErofsAdviseFragmentPcluster   = 0x0020
+
+	// Logical cluster types in the low 2 bits of ZErofsLclusterIndex.DiAdvise.
+	ZErofsLclusterTypePlain   = 0
+	ZErofsLclusterTypeHead1   = 1
+	ZErofsLclusterTypeNonhead = 2
+	ZErofsLclusterTypeHead2   = 3
+	ZErofsLclusterTypeMask    = 0x3
+
+	// Additional flags packed into ZErofsLclusterIndex.DiAdvise above the
+	// 2-bit type. PartialRef marks the trailing lcluster of a partial-ref
+	// pcluster; D0CblkCnt marks a NONHEAD whose di_u carries the block count
+	// of the preceding pcluster instead of a delta.
+	ZErofsLiPartialRef = 1 << 15
+	ZErofsLiD0CblkCnt  = 1 << 11
+
+	SizeZErofsMapHeader     = 8
+	SizeZErofsLclusterIndex = 8
 )
 
 // SuperBlock represents the EROFS on-disk superblock.
@@ -143,6 +176,32 @@ type InodeChunkIndex struct {
 	StartBlkHi uint16 // part of 48-bit support (not yet implemented)
 	DeviceID   uint16
 	StartBlkLo uint32
+}
+
+// ZErofsMapHeader is the 8-byte z_erofs_map_header that immediately follows
+// the inode core + xattr area for compressed inodes and precedes the
+// lcluster index table.
+//
+// On disk the first 4 bytes are a union of h_fragmentoff (for fragment
+// inodes), h_reserved1+h_idata_size (for inline-pcluster inodes), and
+// h_extents_lo. The remaining 4 bytes hold h_advise plus either
+// h_algorithmtype+h_clusterbits or h_extents_hi.
+type ZErofsMapHeader struct {
+	FragmentOff   uint32 // overloaded with h_idata_size in high 16 bits
+	HAdvise       uint16
+	AlgorithmType uint8 // overloaded as low byte of h_extents_hi
+	ClusterBits   uint8 // overloaded as high byte of h_extents_hi
+}
+
+// ZErofsLclusterIndex is one full-format (8-byte) logical cluster index entry.
+// The low ZErofsLclusterTypeMask bits of DiAdvise select the cluster type.
+// For HEAD1/HEAD2/PLAIN clusters DiU is a block address; for NONHEAD it is
+// two little-endian uint16 deltas (delta[0]=distance back to head pcluster,
+// delta[1]=distance forward to the next head).
+type ZErofsLclusterIndex struct {
+	DiAdvise     uint16
+	DiClusterOfs uint16
+	DiU          uint32
 }
 
 // DeviceSlot represents the on-disk device table entry (erofs_deviceslot).

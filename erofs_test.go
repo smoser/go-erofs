@@ -64,14 +64,15 @@ func TestErofs(t *testing.T) {
 		erofstest.SparseFiles.Run(t, erofstest.MkfsErofsMaxSize(1024*1024, chunkFlag))
 	})
 
-	// Compression format is unimplemented — verify EroFS returns ErrNotImplemented.
-	t.Run("lz4-unimplemented", func(t *testing.T) {
+	// Compressed images produced by stock mkfs.erofs -zlz4 must round-trip.
+	t.Run("lz4-mkfs-roundtrip", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("mkfs.erofs compression is not included on Windows")
 		}
+		const content = "this is the file content that will be compressed by lz4\n"
 		tc := erofstest.TarContext{}
 		wt := erofstest.TarAll(
-			tc.File("/file.txt", []byte("content\n"), 0644),
+			tc.File("/file.txt", []byte(content), 0644),
 		)
 		tarStream := erofstest.TarFromWriterTo(wt)
 		defer func() {
@@ -95,10 +96,11 @@ func TestErofs(t *testing.T) {
 			}
 		}()
 
-		_, err = erofs.Open(f)
-		if !errors.Is(err, erofs.ErrNotImplemented) {
-			t.Fatalf("expected ErrNotImplemented, got %v", err)
+		efs, err := erofs.Open(f)
+		if err != nil {
+			t.Fatal("Open compressed image:", err)
 		}
+		erofstest.CheckFile(t, efs, "file.txt", content)
 	})
 }
 
