@@ -154,17 +154,20 @@ func pickDecompressor(algo uint8) (decompressor, error) {
 	return nil, fmt.Errorf("compression algorithm %d: %w", algo, ErrNotImplemented)
 }
 
-// compressor produces a compressed block of bytes. CompressBlock fills dst
-// with the LZ4-compressed encoding of src and returns the number of bytes
-// written. A return value of 0 indicates the input was incompressible (the
-// caller should emit the input uncompressed as a PLAIN lcluster).
+// compressor produces a compressed block of bytes. compressBlock reads from
+// src and writes the LZ4-compressed encoding into dst, returning the number
+// of bytes written. A return value of 0 indicates the input was
+// incompressible (the caller should emit the input uncompressed as a PLAIN
+// lcluster). Argument order is (src, dst), matching the underlying
+// pierrec/lz4 CompressBlock — both []byte, so the type system can't catch
+// a swap; the matching order at least makes the impl pass-through.
 type compressor interface {
-	compressBlock(dst, src []byte) (int, error)
+	compressBlock(src, dst []byte) (int, error)
 }
 
 type lz4Compressor struct{}
 
-func (lz4Compressor) compressBlock(dst, src []byte) (int, error) {
+func (lz4Compressor) compressBlock(src, dst []byte) (int, error) {
 	var c lz4.Compressor
 	n, err := c.CompressBlock(src, dst)
 	if err != nil {

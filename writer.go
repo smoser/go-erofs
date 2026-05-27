@@ -959,7 +959,7 @@ func (w *erofsWriter) compressEntry(e *erofsEntry) error {
 		// If the result fits in fewer than k blocks, emit the multi-lcluster
 		// pcluster. Skip when k == 1 (degenerates to the per-lcluster path).
 		if k > 1 {
-			n, err := comp.compressBlock(compressedBatch, rawBatch[:batchBytes])
+			n, err := comp.compressBlock(rawBatch[:batchBytes], compressedBatch)
 			if err != nil {
 				return fmt.Errorf("compress batch for %s: %w", e.path, err)
 			}
@@ -1003,7 +1003,7 @@ func (w *erofsWriter) compressEntry(e *erofsEntry) error {
 		// Per-lcluster fallback: process each of the k blocks individually.
 		for j := 0; j < k; j++ {
 			block := rawBatch[j*bs : (j+1)*bs]
-			n, err := comp.compressBlock(compressed, block)
+			n, err := comp.compressBlock(block, compressed)
 			if err != nil {
 				return fmt.Errorf("compress block for %s: %w", e.path, err)
 			}
