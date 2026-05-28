@@ -146,11 +146,13 @@ func (img *image) zmapInitLocked(fi *inode, z *zmapState) error {
 	case disk.LayoutCompressedCompact:
 		// Compact bit-packed entries start right after the map header.
 		z.indexStart = hdrPos + disk.SizeZErofsMapHeader
+		// lclusterbits is bounded by the spec; > 14 is invalid encoding,
+		// not a feature gap.
 		if z.lclusterBits > 14 {
-			return fmt.Errorf("compact lclusterbits %d > 14: %w", z.lclusterBits, ErrNotImplemented)
+			return fmt.Errorf("compact lclusterbits %d > 14: %w", z.lclusterBits, ErrInvalid)
 		}
 	default:
-		return fmt.Errorf("inode layout %d is not compressed", fi.inodeLayout)
+		return fmt.Errorf("inode layout %d is not compressed: %w", fi.inodeLayout, ErrInvalid)
 	}
 
 	z.totalLcn = uint32((fi.size + (1<<z.lclusterBits) - 1) >> z.lclusterBits)

@@ -50,7 +50,7 @@ func lz4UncompressPartial(dst, src []byte) (int, error) {
 		if lLen == 0xF {
 			for {
 				if si >= len(src) {
-					return 0, fmt.Errorf("lz4: truncated literal length")
+					return 0, fmt.Errorf("lz4: truncated literal length: %w", ErrInvalid)
 				}
 				x := int(src[si])
 				si++
@@ -67,7 +67,7 @@ func lz4UncompressPartial(dst, src []byte) (int, error) {
 				lLen = len(dst) - di
 			}
 			if si+lLen > len(src) {
-				return 0, fmt.Errorf("lz4: truncated literal data")
+				return 0, fmt.Errorf("lz4: truncated literal data: %w", ErrInvalid)
 			}
 			copy(dst[di:di+lLen], src[si:si+lLen])
 			si += lLen
@@ -87,7 +87,7 @@ func lz4UncompressPartial(dst, src []byte) (int, error) {
 
 		// 16-bit little-endian match offset.
 		if si+2 > len(src) {
-			return 0, fmt.Errorf("lz4: truncated match offset")
+			return 0, fmt.Errorf("lz4: truncated match offset: %w", ErrInvalid)
 		}
 		offset := int(src[si]) | int(src[si+1])<<8
 		si += 2
@@ -100,19 +100,19 @@ func lz4UncompressPartial(dst, src []byte) (int, error) {
 			// where the offset field would be, and silently returning a
 			// short decode would mask real corruption.
 			if di < len(dst) {
-				return 0, fmt.Errorf("lz4: zero match offset before end of output (%d/%d bytes decoded)", di, len(dst))
+				return 0, fmt.Errorf("lz4: zero match offset before end of output (%d/%d bytes decoded): %w", di, len(dst), ErrInvalid)
 			}
 			return di, nil
 		}
 		if offset > di {
-			return 0, fmt.Errorf("lz4: match offset %d > written %d", offset, di)
+			return 0, fmt.Errorf("lz4: match offset %d > written %d: %w", offset, di, ErrInvalid)
 		}
 
 		mLen := token & 0xF
 		if mLen == 0xF {
 			for {
 				if si >= len(src) {
-					return 0, fmt.Errorf("lz4: truncated match length")
+					return 0, fmt.Errorf("lz4: truncated match length: %w", ErrInvalid)
 				}
 				x := int(src[si])
 				si++
