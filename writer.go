@@ -1029,7 +1029,14 @@ func (w *erofsWriter) compressEntry(e *erofsEntry) error {
 			}
 		}
 
-		// Per-lcluster fallback: process each of the k blocks individually.
+		// Per-lcluster fallback: the K-block batch above either didn't
+		// compress (n == 0) or didn't compress small enough to save a
+		// physical block (m >= k). Re-compress each lcluster on its own so
+		// individual blocks can still pick HEAD1 or PLAIN, even though the
+		// batch as a whole couldn't share a pcluster. This costs roughly 2x
+		// compression CPU on incompressible inputs — the batch attempt is
+		// wasted — which is the trade-off for cheap big-pcluster opt-in
+		// without a separate scan phase.
 		for j := 0; j < k; j++ {
 			block := rawBatch[j*bs : (j+1)*bs]
 			n, err := w.comp.compressBlock(block, compressed)
