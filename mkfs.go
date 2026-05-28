@@ -1091,12 +1091,16 @@ type erofsEntry struct {
 	// compressEntry is called between planLayout and write: it appends the
 	// on-disk pcluster bytes (exactly nPblks blocks) to the writer's shared
 	// cspool starting at cspoolOff, fills lclusterEntries (one entry per
-	// lcluster) and sets nPblks (the actual physical block count, which
+	// lcluster), and sets nPblks (the actual physical block count, which
 	// may be less than nLclusters when big-pcluster grouping wins).
+	// hasBigPcluster is set when at least one CBLKCNT NONHEAD was emitted —
+	// readers in writeBlock0 / writeCompressedTrailing consult it without
+	// re-scanning lclusterEntries.
 	nLclusters      uint32
 	nPblks          uint32
 	cspoolOff       int64
 	lclusterEntries []lclusterEntry
+	hasBigPcluster  bool
 }
 
 // lclusterEntry captures the on-disk z_erofs_lcluster_index entry for one

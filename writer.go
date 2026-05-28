@@ -289,7 +289,7 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 			// fs/erofs/zmap.c). Set FeatureIncompatBigPcluster as soon
 			// as any pcluster in the entry actually spans more than one
 			// block. The bit shares value 0x2 with COMPR_CFGS.
-			if entryHasBigPcluster(e) {
+			if e.hasBigPcluster {
 				featureIncompat |= disk.FeatureIncompatBigPcluster
 			}
 		}
@@ -565,7 +565,7 @@ func (w *erofsWriter) writeCompressedTrailing(buf io.Writer, e *erofsEntry) erro
 	// any pcluster spans more than one block. The compressor was resolved
 	// during compressEntries so w.algoID is already set here.
 	var hAdvise uint16
-	if entryHasBigPcluster(e) {
+	if e.hasBigPcluster {
 		hAdvise |= disk.ZErofsAdviseBigPcluster1
 	}
 	var hdr [disk.SizeZErofsMapHeader]byte
@@ -599,20 +599,6 @@ func (w *erofsWriter) writeCompressedTrailing(buf io.Writer, e *erofsEntry) erro
 		}
 	}
 	return nil
-}
-
-// entryHasBigPcluster reports whether any pcluster of e spans more than one
-// physical block (signalled by a NONHEAD with CBLKCNT). When false the
-// emitted lcluster index is functionally equivalent to the single-block
-// encoding and the BIG_PCLUSTER_1 advise bit can be left off.
-func entryHasBigPcluster(e *erofsEntry) bool {
-	for _, le := range e.lclusterEntries {
-		if le.typ == disk.ZErofsLclusterTypeNonhead &&
-			le.delta0&disk.ZErofsLiD0CblkCnt != 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // writeChunkIndexes writes chunk index entries for a regular file.
@@ -1035,6 +1021,7 @@ func (w *erofsWriter) compressEntry(e *erofsEntry) error {
 							return err
 						}
 					}
+					e.hasBigPcluster = true
 					pblk += uint32(m)
 					i += k
 					continue
