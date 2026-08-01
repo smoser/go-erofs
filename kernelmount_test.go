@@ -42,9 +42,9 @@ func TestKernelMountCompressed(t *testing.T) {
 	// inline-eligible, big-pcluster compressible, partial-tail compressible,
 	// incompressible (forces PLAIN fallback).
 	files := map[string][]byte{
-		"/tiny.txt":      []byte("hi\n"),
-		"/compressible":  bytes.Repeat([]byte("the quick brown fox jumps over the lazy dog\n"), 1500),
-		"/partial-tail":  append(bytes.Repeat([]byte("ABCDEFGHIJKLMNOP"), 4096), []byte("trailer\n")...),
+		"/tiny.txt":     []byte("hi\n"),
+		"/compressible": bytes.Repeat([]byte("the quick brown fox jumps over the lazy dog\n"), 1500),
+		"/partial-tail": append(bytes.Repeat([]byte("ABCDEFGHIJKLMNOP"), 4096), []byte("trailer\n")...),
 		"/incompressible": func() []byte {
 			b := make([]byte, 32*1024)
 			for i := range b {

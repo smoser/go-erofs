@@ -143,7 +143,6 @@ func lz4UncompressPartial(dst, src []byte) (int, error) {
 	return di, nil
 }
 
-
 // pickDecompressor returns the decompressor for the given on-disk algorithm
 // identifier, or an error if the algorithm is unsupported.
 func pickDecompressor(algo uint8) (decompressor, error) {

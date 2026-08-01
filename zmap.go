@@ -155,7 +155,7 @@ func (img *image) zmapInitLocked(fi *inode, z *zmapState) error {
 		return fmt.Errorf("inode layout %d is not compressed: %w", fi.inodeLayout, ErrInvalid)
 	}
 
-	z.totalLcn = uint32((fi.size + (1<<z.lclusterBits) - 1) >> z.lclusterBits)
+	z.totalLcn = uint32((fi.size + (1 << z.lclusterBits) - 1) >> z.lclusterBits)
 	return nil
 }
 

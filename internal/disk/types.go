@@ -4,7 +4,7 @@ const (
 	MagicNumber      = 0xe0f5e1e2
 	SuperBlockOffset = 1024
 
-	FeatureIncompatLZ4_0Padding         = 0x1
+	FeatureIncompatLZ4_0Padding = 0x1
 	// FeatureIncompatComprCfgs covers both the per-algorithm compression
 	// configuration area (placed right after the superblock) and the
 	// "big pcluster" capability — the kernel uses 0x02 for both.
