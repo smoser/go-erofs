@@ -97,11 +97,11 @@ func (w *erofsWriter) resolveCompressor() error {
 	if w.compResolved {
 		return nil
 	}
-	algoID, comp, err := pickCompressor(w.compression)
+	comp, err := pickCompressor(w.compression)
 	if err != nil {
 		return err
 	}
-	w.algoID = algoID
+	w.algoID = comp.algorithmID()
 	w.comp = comp
 	w.compResolved = true
 	return nil
@@ -374,7 +374,8 @@ func (w *erofsWriter) writeMetadataInodes(buf io.Writer) error {
 		// Write trailing data
 		switch e.mode & disk.StatTypeMask {
 		case disk.StatTypeReg:
-			if e.layout == disk.LayoutChunkBased && (e.size > 0 || len(e.chunks) > 0) {
+			switch {
+			case e.layout == disk.LayoutChunkBased && (e.size > 0 || len(e.chunks) > 0):
 				// Align the chunk-index map to the chunk-index unit.
 				if e.chunkPad > 0 {
 					if _, err := buf.Write(w.zeroBuf[:e.chunkPad]); err != nil {
@@ -386,12 +387,12 @@ func (w *erofsWriter) writeMetadataInodes(buf io.Writer) error {
 					return fmt.Errorf("write chunks for %s: %w", e.path, err)
 				}
 				metaStart += e.trailingSize
-			} else if e.layout == disk.LayoutCompressedFull {
+			case e.layout == disk.LayoutCompressedFull:
 				if err := w.writeCompressedTrailing(buf, e); err != nil {
 					return fmt.Errorf("write compressed metadata for %s: %w", e.path, err)
 				}
 				metaStart += e.trailingSize
-			} else if e.layout == disk.LayoutFlatInline && e.size > 0 && e.data != nil {
+			case e.layout == disk.LayoutFlatInline && e.size > 0 && e.data != nil:
 				// e.data may be an unbounded reader (e.g. directData from CopyFrom);
 				// limit to e.size bytes to prevent overwriting subsequent metadata.
 				expected := int64(e.size)

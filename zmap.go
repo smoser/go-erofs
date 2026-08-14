@@ -418,7 +418,6 @@ func (img *image) zmapLookup(fi *inode, ofs int64) (zextent, error) {
 		return zextent{}, err
 	}
 
-	end := int64(m.lcn+1) << lclusterBits
 	switch m.typ {
 	case disk.ZErofsLclusterTypePlain,
 		disk.ZErofsLclusterTypeHead1,
@@ -430,7 +429,6 @@ func (img *image) zmapLookup(fi *inode, ofs int64) (zextent, error) {
 		if m.lcn == 0 {
 			return zextent{}, fmt.Errorf("invalid lcluster 0 at nid %d: %w", fi.nid, ErrInvalid)
 		}
-		end = (int64(m.lcn) << lclusterBits) | int64(m.clusterOfs)
 		m.delta[0] = 1
 		fallthrough
 	case disk.ZErofsLclusterTypeNonhead:
@@ -455,11 +453,10 @@ func (img *image) zmapLookup(fi *inode, ofs int64) (zextent, error) {
 	// terminator's clusterofs marks the partial-tail end of this extent.
 	// Single-lcluster pclusters get exactly one lcluster's worth; multi-
 	// lcluster extents (big-pcluster or dedup'd) cover several.
-	endByte, err := img.extentDecompressedEnd(fi, z, headLcn)
+	end, err := img.extentDecompressedEnd(fi, z, headLcn)
 	if err != nil {
 		return zextent{}, err
 	}
-	end = endByte
 
 	blockSize := int64(1) << img.sb.BlkSizeBits
 	ext := zextent{

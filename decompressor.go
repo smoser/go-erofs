@@ -146,8 +146,7 @@ func lz4UncompressPartial(dst, src []byte) (int, error) {
 // pickDecompressor returns the decompressor for the given on-disk algorithm
 // identifier, or an error if the algorithm is unsupported.
 func pickDecompressor(algo uint8) (decompressor, error) {
-	switch algo {
-	case disk.ZErofsCompressionLZ4:
+	if algo == disk.ZErofsCompressionLZ4 {
 		return lz4Decompressor{}, nil
 	}
 	return nil, fmt.Errorf("compression algorithm %d: %w", algo, ErrNotImplemented)
@@ -160,8 +159,12 @@ func pickDecompressor(algo uint8) (decompressor, error) {
 // lcluster). Argument order is (src, dst), matching the underlying
 // pierrec/lz4 CompressBlock — both []byte, so the type system can't catch
 // a swap; the matching order at least makes the impl pass-through.
+//
+// algorithmID reports the on-disk Z_EROFS_COMPRESSION_* identifier recorded
+// in the z_erofs map header and the superblock's compression bitmap.
 type compressor interface {
 	compressBlock(src, dst []byte) (int, error)
+	algorithmID() uint8
 }
 
 type lz4Compressor struct{}
@@ -175,12 +178,13 @@ func (lz4Compressor) compressBlock(src, dst []byte) (int, error) {
 	return n, nil
 }
 
-// pickCompressor returns a compressor for the given algorithm. Algorithm 0
-// (LZ4) is the only supported writer target.
-func pickCompressor(c Compression) (uint8, compressor, error) {
-	switch c {
-	case CompressionLZ4:
-		return disk.ZErofsCompressionLZ4, lz4Compressor{}, nil
+func (lz4Compressor) algorithmID() uint8 { return disk.ZErofsCompressionLZ4 }
+
+// pickCompressor returns a compressor for the given algorithm. LZ4 is the
+// only supported writer target.
+func pickCompressor(c Compression) (compressor, error) {
+	if c == CompressionLZ4 {
+		return lz4Compressor{}, nil
 	}
-	return 0, nil, fmt.Errorf("compression %d: %w", c, ErrNotImplemented)
+	return nil, fmt.Errorf("compression %d: %w", c, ErrNotImplemented)
 }
